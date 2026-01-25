@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: satwik-farms-backend
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: satwik-farms-db
+          property: connectionString
+      - key: ACCU360_CLIENT_ID
+        sync: false
+      - key: ACCU360_CLIENT_SECRET
+        sync: false
+      - key: ACCU360_AUTH_URL
+        sync: false
+      - key: ACCU360_TOKEN_URL
+        sync: false
+      - key: ACCU360_API_BASE_URL
+        sync: false
+      - key: BACKEND_BASE_URL
+        sync: false
+
+databases:
+  - name: satwik-farms-db
+    plan: free
