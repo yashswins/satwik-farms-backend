@@ -14,12 +14,9 @@ load_dotenv()
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./orders.db")
-ACCU360_CLIENT_ID = os.getenv("ACCU360_CLIENT_ID")
-ACCU360_CLIENT_SECRET = os.getenv("ACCU360_CLIENT_SECRET")
-ACCU360_AUTH_URL = os.getenv("ACCU360_AUTH_URL")
-ACCU360_TOKEN_URL = os.getenv("ACCU360_TOKEN_URL")
+ACCU360_API_KEY = os.getenv("ACCU360_API_KEY")
+ACCU360_API_SECRET = os.getenv("ACCU360_API_SECRET")
 ACCU360_API_BASE_URL = os.getenv("ACCU360_API_BASE_URL")
-BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret")
 
 # Database Setup
@@ -42,14 +39,6 @@ class Order(Base):
     delivery_notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class OAuthToken(Base):
-    __tablename__ = "oauth_tokens"
-    id = Column(Integer, primary_key=True)
-    access_token = Column(Text)
-    refresh_token = Column(Text)
-    expires_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
@@ -101,53 +90,33 @@ def generate_order_id():
     import random
     return f"SF-{now.strftime('%Y%m%d')}-{random.randint(10000, 99999)}"
 
-async def get_valid_token(db: Session) -> str:
-    """Get valid OAuth token, refresh if needed"""
-    token = db.query(OAuthToken).order_by(OAuthToken.id.desc()).first()
+def get_accu360_auth_header() -> dict:
+    """Get Accu360 API authentication header"""
+    if not ACCU360_API_KEY or not ACCU360_API_SECRET:
+        raise HTTPException(status_code=500, detail="Accu360 API credentials not configured")
 
-    if not token:
-        raise HTTPException(status_code=500, detail="OAuth not configured. Run /auth/accu360/initiate first.")
-
-    # Refresh if expired or about to expire
-    if datetime.utcnow() >= token.expires_at - timedelta(minutes=5):
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                ACCU360_TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": token.refresh_token,
-                    "client_id": ACCU360_CLIENT_ID,
-                    "client_secret": ACCU360_CLIENT_SECRET,
-                }
-            )
-            if response.status_code != 200:
-                raise HTTPException(status_code=500, detail="Failed to refresh OAuth token")
-
-            data = response.json()
-            token.access_token = data["access_token"]
-            token.refresh_token = data.get("refresh_token", token.refresh_token)
-            token.expires_at = datetime.utcnow() + timedelta(seconds=data["expires_in"])
-            db.commit()
-
-    return token.access_token
+    return {
+        "Authorization": f"token {ACCU360_API_KEY}:{ACCU360_API_SECRET}",
+        "Content-Type": "application/json"
+    }
 
 async def find_or_create_customer(
-    access_token: str,
     customer_name: str,
     customer_phone: str,
     customer_address: str
 ) -> str:
     """Find existing customer by phone or create new one. Returns customer name for Sales Order."""
 
+    auth_headers = get_accu360_auth_header()
+
     async with httpx.AsyncClient() as client:
         # Search for customer by phone number
-        # Try both mobile_no and phone fields
         search_filters = f'[["mobile_no","like","%{customer_phone[-9:]}%"]]'
         search_url = f"{ACCU360_API_BASE_URL}/api/resource/Customer?filters={search_filters}&fields=[\"name\",\"customer_name\",\"mobile_no\"]"
 
         response = await client.get(
             search_url,
-            headers={"Authorization": f"Bearer {access_token}"}
+            headers=auth_headers
         )
 
         if response.status_code == 200:
@@ -169,10 +138,7 @@ async def find_or_create_customer(
 
         create_response = await client.post(
             f"{ACCU360_API_BASE_URL}/api/resource/Customer",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            },
+            headers=auth_headers,
             json=new_customer
         )
 
@@ -187,59 +153,11 @@ async def find_or_create_customer(
 
 # Endpoints
 @app.get("/health")
-async def health(db: Session = Depends(get_db)):
-    token = db.query(OAuthToken).order_by(OAuthToken.id.desc()).first()
+async def health():
     return {
         "status": "healthy",
-        "accu360_connected": token is not None,
-        "token_expires_in": int((token.expires_at - datetime.utcnow()).total_seconds()) if token else 0
+        "accu360_configured": bool(ACCU360_API_KEY and ACCU360_API_SECRET)
     }
-
-@app.get("/auth/accu360/initiate")
-async def initiate_oauth():
-    """Redirect admin to Accu360 OAuth"""
-    redirect_uri = f"{BACKEND_BASE_URL}/auth/accu360/callback"
-    auth_url = (
-        f"{ACCU360_AUTH_URL}"
-        f"?client_id={ACCU360_CLIENT_ID}"
-        f"&response_type=code"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope=openid all"
-    )
-    return {"auth_url": auth_url, "message": "Visit the auth_url to authorize"}
-
-@app.get("/auth/accu360/callback")
-async def oauth_callback(code: str, db: Session = Depends(get_db)):
-    """Handle OAuth callback from Accu360"""
-    redirect_uri = f"{BACKEND_BASE_URL}/auth/accu360/callback"
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            ACCU360_TOKEN_URL,
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": redirect_uri,
-                "client_id": ACCU360_CLIENT_ID,
-                "client_secret": ACCU360_CLIENT_SECRET,
-            }
-        )
-
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="OAuth token exchange failed")
-
-        data = response.json()
-
-        # Store token
-        token = OAuthToken(
-            access_token=data["access_token"],
-            refresh_token=data["refresh_token"],
-            expires_at=datetime.utcnow() + timedelta(seconds=data["expires_in"])
-        )
-        db.add(token)
-        db.commit()
-
-        return {"message": "OAuth configured successfully!"}
 
 @app.post("/orders")
 async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db)):
@@ -256,12 +174,8 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
     # Generate order ID
     order_id = generate_order_id()
 
-    # Get OAuth token
-    access_token = await get_valid_token(db)
-
     # Find or create customer in Accu360
     customer_id = await find_or_create_customer(
-        access_token=access_token,
         customer_name=request.customer_name,
         customer_phone=request.customer_phone,
         customer_address=request.customer_address
@@ -291,10 +205,7 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{ACCU360_API_BASE_URL}/api/resource/Sales Order",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            },
+            headers=get_accu360_auth_header(),
             json=accu360_payload
         )
 

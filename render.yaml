@@ -10,17 +10,13 @@ services:
         fromDatabase:
           name: satwik-farms-db
           property: connectionString
-      - key: ACCU360_CLIENT_ID
+      - key: ACCU360_API_KEY
         sync: false
-      - key: ACCU360_CLIENT_SECRET
-        sync: false
-      - key: ACCU360_AUTH_URL
-        sync: false
-      - key: ACCU360_TOKEN_URL
+      - key: ACCU360_API_SECRET
         sync: false
       - key: ACCU360_API_BASE_URL
         sync: false
-      - key: BACKEND_BASE_URL
+      - key: WEBHOOK_SECRET
         sync: false
 
 databases:
