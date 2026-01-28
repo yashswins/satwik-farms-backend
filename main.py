@@ -17,6 +17,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./orders.db")
 ACCU360_API_KEY = os.getenv("ACCU360_API_KEY")
 ACCU360_API_SECRET = os.getenv("ACCU360_API_SECRET")
 ACCU360_API_BASE_URL = os.getenv("ACCU360_API_BASE_URL")
+ACCU360_DEFAULT_CITY = os.getenv("ACCU360_DEFAULT_CITY")
+ACCU360_DEFAULT_PROVINCE = os.getenv("ACCU360_DEFAULT_PROVINCE")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret")
 
 # Database Setup
@@ -164,12 +166,20 @@ async def create_shipping_address(
     customer_phone: str,
     customer_address: str
 ) -> str:
+    if not ACCU360_DEFAULT_CITY or not ACCU360_DEFAULT_PROVINCE:
+        raise HTTPException(
+            status_code=500,
+            detail="Accu360 address defaults not configured (city/province)"
+        )
+
     auth_headers = get_accu360_auth_header()
     address_payload = {
         "doctype": "Address",
         "address_title": customer_name,
         "address_type": "Shipping",
         "address_line1": customer_address,
+        "city": ACCU360_DEFAULT_CITY,
+        "province": ACCU360_DEFAULT_PROVINCE,
         "phone": customer_phone,
         "links": [
             {
