@@ -100,6 +100,12 @@ def get_accu360_auth_header() -> dict:
         "Content-Type": "application/json"
     }
 
+def safe_response_json(response: httpx.Response) -> dict:
+    try:
+        return response.json()
+    except ValueError:
+        return {}
+
 async def find_or_create_customer(
     customer_name: str,
     customer_phone: str,
@@ -120,11 +126,11 @@ async def find_or_create_customer(
         )
 
         if response.status_code == 200:
-            data = response.json()
+            data = safe_response_json(response)
             customers = data.get("data", [])
             if customers:
                 # Found existing customer - return the "name" field (customer ID)
-                return customers[0]["name"]
+                return customers[0].get("name", customer_name)
 
         # Customer not found - create new one
         new_customer = {
@@ -143,7 +149,7 @@ async def find_or_create_customer(
         )
 
         if create_response.status_code in [200, 201]:
-            created = create_response.json()
+            created = safe_response_json(create_response)
             # Return the new customer's name (ID)
             return created.get("data", {}).get("name", customer_name)
         else:
@@ -226,10 +232,37 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
             db.add(db_order)
             db.commit()
 
-            error_detail = response.json().get("error", "Unknown error")
+            error_data = safe_response_json(response)
+            error_detail = (
+                error_data.get("error")
+                or error_data.get("message")
+                or error_data.get("detail")
+            )
+            if not error_detail:
+                text = response.text.strip()
+                error_detail = text if text else "Empty response from Accu360"
             raise HTTPException(status_code=502, detail=f"Accu360 error: {error_detail}")
 
-        accu360_data = response.json()
+        accu360_data = safe_response_json(response)
+        if not accu360_data:
+            db_order = Order(
+                id=order_id,
+                status="failed",
+                customer_name=request.customer_name,
+                customer_phone=request.customer_phone,
+                customer_address=request.customer_address,
+                items=[item.model_dump() for item in request.items],
+                subtotal=request.subtotal,
+                delivery_fee=request.delivery_fee,
+                total=request.total,
+                delivery_notes=request.delivery_notes
+            )
+            db.add(db_order)
+            db.commit()
+            raise HTTPException(
+                status_code=502,
+                detail="Accu360 returned empty or invalid response"
+            )
         # Frappe returns {"data": {"name": "SAL-ORD-XXXXX", ...}}
         accu360_order_id = accu360_data.get("data", {}).get("name", order_id)
 
