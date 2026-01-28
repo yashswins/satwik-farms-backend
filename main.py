@@ -270,7 +270,6 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
             for item in request.items
         ],
         "contact_phone": request.customer_phone,
-        "shipping_address_name": request.customer_address,
         "instructions": request.delivery_notes or ""
     }
 
