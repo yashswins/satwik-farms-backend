@@ -97,7 +97,8 @@ def get_accu360_auth_header() -> dict:
 
     return {
         "Authorization": f"token {ACCU360_API_KEY}:{ACCU360_API_SECRET}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json"
     }
 
 def safe_response_json(response: httpx.Response) -> dict:
@@ -157,6 +158,54 @@ async def find_or_create_customer(
             # (in case it matches an existing customer)
             return customer_name
 
+async def create_shipping_address(
+    customer_id: str,
+    customer_name: str,
+    customer_phone: str,
+    customer_address: str
+) -> str:
+    auth_headers = get_accu360_auth_header()
+    address_payload = {
+        "doctype": "Address",
+        "address_title": customer_name,
+        "address_type": "Shipping",
+        "address_line1": customer_address,
+        "phone": customer_phone,
+        "links": [
+            {
+                "link_doctype": "Customer",
+                "link_name": customer_id
+            }
+        ]
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{ACCU360_API_BASE_URL}/api/resource/Address",
+            headers=auth_headers,
+            json=address_payload
+        )
+
+        if response.status_code in [200, 201]:
+            created = safe_response_json(response)
+            address_name = (
+                created.get("data", {}).get("name")
+                or created.get("name")
+            )
+            if address_name:
+                return address_name
+
+        error_data = safe_response_json(response)
+        error_detail = (
+            error_data.get("error")
+            or error_data.get("message")
+            or error_data.get("detail")
+        )
+        if not error_detail:
+            text = response.text.strip()
+            error_detail = text if text else "Empty response from Accu360"
+        raise HTTPException(status_code=502, detail=f"Accu360 error: {error_detail}")
+
 # Endpoints
 @app.get("/health")
 async def health():
@@ -186,6 +235,12 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
         customer_phone=request.customer_phone,
         customer_address=request.customer_address
     )
+    shipping_address_name = await create_shipping_address(
+        customer_id=customer_id,
+        customer_name=request.customer_name,
+        customer_phone=request.customer_phone,
+        customer_address=request.customer_address
+    )
 
     # Build Frappe Sales Order payload
     accu360_payload = {
@@ -193,6 +248,8 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
         "customer": customer_id,  # Links to Customer record in Accu360
         "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d"),
         "po_no": order_id,  # External reference
+        "customer_address": shipping_address_name,
+        "shipping_address_name": shipping_address_name,
         "items": [
             {
                 "item_code": item.accu360_sku,
