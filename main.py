@@ -350,6 +350,7 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
         db.commit()
 
         return {
+            "success": True,
             "order_id": order_id,
             "accu360_order_id": accu360_order_id,
             "status": "pending",
