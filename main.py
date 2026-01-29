@@ -159,8 +159,8 @@ async def find_or_create_customer(
             return created.get("data", {}).get("name", customer_name)
         else:
             # If customer creation fails, try using customer_name directly
-        # (in case it matches an existing customer)
-        return customer_name
+            # (in case it matches an existing customer)
+            return customer_name
 
 async def sync_customer_fields(
     customer_id: str,
