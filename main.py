@@ -143,6 +143,8 @@ async def find_or_create_customer(
             "customer_group": "Individual",  # Adjust if your system uses different groups
             "territory": "All Territories",  # Adjust to your territory
             "mobile_no": customer_phone,
+            "customer_full_name": customer_name,
+            "mobile_number": customer_phone,
         }
 
         create_response = await client.post(
