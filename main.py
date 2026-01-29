@@ -159,8 +159,54 @@ async def find_or_create_customer(
             return created.get("data", {}).get("name", customer_name)
         else:
             # If customer creation fails, try using customer_name directly
-            # (in case it matches an existing customer)
-            return customer_name
+        # (in case it matches an existing customer)
+        return customer_name
+
+async def sync_customer_fields(
+    customer_id: str,
+    customer_name: str,
+    customer_phone: str
+) -> None:
+    auth_headers = get_accu360_auth_header()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{ACCU360_API_BASE_URL}/api/resource/Customer/{customer_id}"
+            "?fields=[\"name\",\"customer_name\",\"mobile_no\",\"mobile_number\",\"customer_full_name\"]",
+            headers=auth_headers
+        )
+
+        if response.status_code != 200:
+            return
+
+        data = safe_response_json(response).get("data", {})
+        current_mobile_number = (data.get("mobile_number") or "").strip()
+        current_mobile_no = (data.get("mobile_no") or "").strip()
+        current_full_name = (data.get("customer_full_name") or "").strip()
+        current_customer_name = (data.get("customer_name") or "").strip()
+
+        should_update = (
+            not current_full_name
+            or not current_mobile_number
+            or current_mobile_number == current_customer_name
+            or current_mobile_number == current_full_name
+        )
+
+        if not should_update:
+            return
+
+        update_payload = {
+            "customer_full_name": customer_name,
+            "mobile_number": customer_phone,
+            "mobile_no": customer_phone,
+            "customer_name": customer_name
+        }
+
+        await client.put(
+            f"{ACCU360_API_BASE_URL}/api/resource/Customer/{customer_id}",
+            headers=auth_headers,
+            json=update_payload
+        )
 
 async def create_shipping_address(
     customer_id: str,
@@ -246,6 +292,11 @@ async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db
         customer_name=request.customer_name,
         customer_phone=request.customer_phone,
         customer_address=request.customer_address
+    )
+    await sync_customer_fields(
+        customer_id=customer_id,
+        customer_name=request.customer_name,
+        customer_phone=request.customer_phone
     )
     shipping_address_name = await create_shipping_address(
         customer_id=customer_id,
