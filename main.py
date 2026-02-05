@@ -21,6 +21,12 @@ ACCU360_DEFAULT_CITY = os.getenv("ACCU360_DEFAULT_CITY")
 ACCU360_DEFAULT_PROVINCE = os.getenv("ACCU360_DEFAULT_PROVINCE")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret")
 
+# API Authentication - Add these keys from your Android app
+VALID_API_KEYS = [
+    os.getenv("APP_API_KEY_DEBUG", "fa2582e2af1c20de90daf3e7fbfde118bd580c99c747e4de5d9556282dc77f59"),
+    os.getenv("APP_API_KEY_RELEASE", "49f8ba687c8af783d5307e314421da6e2f84d0ac961339bc75cb4fee5d6b487c"),
+]
+
 # Database Setup
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -86,6 +92,22 @@ def get_db():
         yield db
     finally:
         db.close()
+
+async def verify_api_key(x_api_key: str = Header(None)):
+    """Verify API key from X-API-Key header"""
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key. Include X-API-Key header."
+        )
+
+    if x_api_key not in VALID_API_KEYS:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key"
+        )
+
+    return x_api_key
 
 def generate_order_id():
     now = datetime.utcnow()
@@ -273,7 +295,11 @@ async def health():
     }
 
 @app.post("/orders")
-async def create_order(request: CreateOrderRequest, db: Session = Depends(get_db)):
+async def create_order(
+    request: CreateOrderRequest,
+    db: Session = Depends(get_db),
+    api_key: str = Depends(verify_api_key)
+):
     """Create order and submit to Accu360"""
 
     # Validate SKUs
