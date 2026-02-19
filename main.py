@@ -20,6 +20,8 @@ ACCU360_API_BASE_URL = os.getenv("ACCU360_API_BASE_URL")
 ACCU360_DEFAULT_CITY = os.getenv("ACCU360_DEFAULT_CITY")
 ACCU360_DEFAULT_PROVINCE = os.getenv("ACCU360_DEFAULT_PROVINCE")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # API Authentication - Add these keys from your Android app
 VALID_API_KEYS = [
@@ -28,7 +30,13 @@ VALID_API_KEYS = [
 ]
 
 # Database Setup
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,   # verify connection health before use (prevents stale SSL errors)
+    pool_recycle=300,     # recycle connections every 5 min to avoid idle timeouts
+    pool_size=5,          # base concurrent orders
+    max_overflow=5,       # burst up to 10 total connections under peak load
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -131,6 +139,56 @@ def safe_response_json(response: httpx.Response) -> dict:
     except ValueError:
         return {}
 
+# async def send_telegram(message: str) -> None:
+#     """Send a Telegram notification to the shop owner. Never raises."""
+#     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+#         return
+#     try:
+#         async with httpx.AsyncClient(timeout=10.0) as client:
+#             await client.post(
+#                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+#                 json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+#             )
+#     except Exception as e:
+#         print(f"WARNING: Telegram send failed: {e}")
+
+def save_order_to_db(
+    db: Session,
+    order_id: str,
+    accu360_order_id: Optional[str],
+    status: str,
+    request: "CreateOrderRequest",
+) -> None:
+    """Upsert order in local DB — never raises."""
+    try:
+        existing = db.query(Order).filter(Order.id == order_id).first()
+        if existing:
+            existing.status = status
+            if accu360_order_id:
+                existing.accu360_order_id = accu360_order_id
+            db.commit()
+        else:
+            db.add(Order(
+                id=order_id,
+                accu360_order_id=accu360_order_id,
+                status=status,
+                customer_name=request.customer_name,
+                customer_phone=request.customer_phone,
+                customer_address=request.customer_address,
+                items=[item.model_dump() for item in request.items],
+                subtotal=request.subtotal,
+                delivery_fee=request.delivery_fee,
+                total=request.total,
+                delivery_notes=request.delivery_notes,
+            ))
+            db.commit()
+    except Exception as db_err:
+        print(f"WARNING: DB save failed for order {order_id}: {db_err}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
 async def find_or_create_customer(
     customer_name: str,
     customer_phone: str,
@@ -140,7 +198,7 @@ async def find_or_create_customer(
 
     auth_headers = get_accu360_auth_header()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         # Search for customer by phone number
         search_filters = f'[["mobile_no","like","%{customer_phone[-9:]}%"]]'
         search_url = f"{ACCU360_API_BASE_URL}/api/resource/Customer?filters={search_filters}&fields=[\"name\",\"customer_name\",\"mobile_no\"]"
@@ -191,7 +249,7 @@ async def sync_customer_fields(
 ) -> None:
     auth_headers = get_accu360_auth_header()
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
             f"{ACCU360_API_BASE_URL}/api/resource/Customer/{customer_id}"
             "?fields=[\"name\",\"customer_name\",\"mobile_no\",\"mobile_number\",\"customer_full_name\"]",
@@ -259,7 +317,7 @@ async def create_shipping_address(
         ]
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"{ACCU360_API_BASE_URL}/api/resource/Address",
             headers=auth_headers,
@@ -297,6 +355,7 @@ async def health():
 @app.post("/orders")
 async def create_order(
     request: CreateOrderRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     api_key: str = Depends(verify_api_key)
 ):
@@ -310,123 +369,94 @@ async def create_order(
             detail=f"Missing accu360_sku for products: {', '.join(missing_skus)}"
         )
 
-    # Generate order ID
+    # Generate order ID and save to DB immediately — order is never lost even if Accu360 fails
     order_id = generate_order_id()
+    save_order_to_db(db, order_id, None, "queued", request)
 
-    # Find or create customer in Accu360
-    customer_id = await find_or_create_customer(
-        customer_name=request.customer_name,
-        customer_phone=request.customer_phone,
-        customer_address=request.customer_address
-    )
-    await sync_customer_fields(
-        customer_id=customer_id,
-        customer_name=request.customer_name,
-        customer_phone=request.customer_phone
-    )
-    shipping_address_name = await create_shipping_address(
-        customer_id=customer_id,
-        customer_name=request.customer_name,
-        customer_phone=request.customer_phone,
-        customer_address=request.customer_address
+    items_summary = "\n".join(
+        f"  • {item.name} x{item.quantity} @ TSH {item.unit_price:,.0f}"
+        for item in request.items
     )
 
-    # Build Frappe Sales Order payload
-    accu360_payload = {
-        "doctype": "Sales Order",
-        "customer": customer_id,  # Links to Customer record in Accu360
-        "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d"),
-        "po_no": order_id,  # External reference
-        "customer_address": shipping_address_name,
-        "shipping_address_name": shipping_address_name,
-        "items": [
-            {
-                "item_code": item.accu360_sku,
-                "qty": item.quantity,
-                "rate": item.unit_price,
-                "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
-            }
-            for item in request.items
-        ],
-        "contact_phone": request.customer_phone,
-        "instructions": request.delivery_notes or ""
-    }
-
-    # Submit to Accu360 (Frappe API)
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{ACCU360_API_BASE_URL}/api/resource/Sales Order",
-            headers=get_accu360_auth_header(),
-            json=accu360_payload
+    try:
+        # Find or create customer in Accu360
+        customer_id = await find_or_create_customer(
+            customer_name=request.customer_name,
+            customer_phone=request.customer_phone,
+            customer_address=request.customer_address
+        )
+        await sync_customer_fields(
+            customer_id=customer_id,
+            customer_name=request.customer_name,
+            customer_phone=request.customer_phone
+        )
+        shipping_address_name = await create_shipping_address(
+            customer_id=customer_id,
+            customer_name=request.customer_name,
+            customer_phone=request.customer_phone,
+            customer_address=request.customer_address
         )
 
-        if response.status_code not in [200, 201]:
-            # Store order as failed
-            db_order = Order(
-                id=order_id,
-                status="failed",
-                customer_name=request.customer_name,
-                customer_phone=request.customer_phone,
-                customer_address=request.customer_address,
-                items=[item.model_dump() for item in request.items],
-                subtotal=request.subtotal,
-                delivery_fee=request.delivery_fee,
-                total=request.total,
-                delivery_notes=request.delivery_notes
-            )
-            db.add(db_order)
-            db.commit()
+        # Build Frappe Sales Order payload
+        accu360_payload = {
+            "doctype": "Sales Order",
+            "customer": customer_id,
+            "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d"),
+            "po_no": order_id,
+            "customer_address": shipping_address_name,
+            "shipping_address_name": shipping_address_name,
+            "items": [
+                {
+                    "item_code": item.accu360_sku,
+                    "qty": item.quantity,
+                    "rate": item.unit_price,
+                    "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+                }
+                for item in request.items
+            ],
+            "contact_phone": request.customer_phone,
+            "instructions": request.delivery_notes or ""
+        }
 
+        # Submit to Accu360 (Frappe API)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ACCU360_API_BASE_URL}/api/resource/Sales Order",
+                headers=get_accu360_auth_header(),
+                json=accu360_payload
+            )
+
+        if response.status_code not in [200, 201]:
             error_data = safe_response_json(response)
             error_detail = (
                 error_data.get("error")
                 or error_data.get("message")
                 or error_data.get("detail")
+                or response.text.strip()
+                or "Accu360 rejected the order"
             )
-            if not error_detail:
-                text = response.text.strip()
-                error_detail = text if text else "Empty response from Accu360"
             raise HTTPException(status_code=502, detail=f"Accu360 error: {error_detail}")
 
         accu360_data = safe_response_json(response)
         if not accu360_data:
-            db_order = Order(
-                id=order_id,
-                status="failed",
-                customer_name=request.customer_name,
-                customer_phone=request.customer_phone,
-                customer_address=request.customer_address,
-                items=[item.model_dump() for item in request.items],
-                subtotal=request.subtotal,
-                delivery_fee=request.delivery_fee,
-                total=request.total,
-                delivery_notes=request.delivery_notes
-            )
-            db.add(db_order)
-            db.commit()
-            raise HTTPException(
-                status_code=502,
-                detail="Accu360 returned empty or invalid response"
-            )
+            raise HTTPException(status_code=502, detail="Accu360 returned empty or invalid response")
+
         # Frappe returns {"data": {"name": "SAL-ORD-XXXXX", ...}}
         accu360_order_id = accu360_data.get("data", {}).get("name", order_id)
 
-        # Store order
-        db_order = Order(
-            id=order_id,
-            accu360_order_id=accu360_order_id,
-            status="pending",
-            customer_name=request.customer_name,
-            customer_phone=request.customer_phone,
-            customer_address=request.customer_address,
-            items=[item.model_dump() for item in request.items],
-            subtotal=request.subtotal,
-            delivery_fee=request.delivery_fee,
-            total=request.total,
-            delivery_notes=request.delivery_notes
-        )
-        db.add(db_order)
-        db.commit()
+        # Update local DB to pending (non-fatal)
+        save_order_to_db(db, order_id, accu360_order_id, "pending", request)
+
+        # background_tasks.add_task(
+        #     send_telegram,
+        #     f"🛒 <b>New Order Placed</b>\n"
+        #     f"<b>Order:</b> {order_id} → {accu360_order_id}\n"
+        #     f"<b>Customer:</b> {request.customer_name}\n"
+        #     f"<b>Phone:</b> {request.customer_phone}\n"
+        #     f"<b>Address:</b> {request.customer_address}\n"
+        #     f"<b>Items:</b>\n{items_summary}\n"
+        #     f"<b>Total:</b> TSH {request.total:,.0f}"
+        # )
 
         return {
             "success": True,
@@ -434,8 +464,34 @@ async def create_order(
             "accu360_order_id": accu360_order_id,
             "status": "pending",
             "message": "Order submitted successfully",
-            "created_at": db_order.created_at.isoformat()
+            "created_at": datetime.utcnow().isoformat()
         }
+
+    except HTTPException as exc:
+        # Mark order as failed
+        save_order_to_db(db, order_id, None, "failed", request)
+        # await send_telegram(
+        #     f"❌ <b>Order FAILED — Action Required</b>\n"
+        #     f"<b>Order:</b> {order_id}\n"
+        #     f"<b>Customer:</b> {request.customer_name}\n"
+        #     f"<b>Phone:</b> {request.customer_phone}\n"
+        #     f"<b>Address:</b> {request.customer_address}\n"
+        #     f"<b>Items:</b>\n{items_summary}\n"
+        #     f"<b>Total:</b> TSH {request.total:,.0f}\n"
+        #     f"<b>Error:</b> {exc.detail}\n"
+        #     f"⚠️ Contact customer and process manually if needed."
+        # )
+        raise
+
+    except Exception as exc:
+        save_order_to_db(db, order_id, None, "failed", request)
+        # await send_telegram(
+        #     f"🚨 <b>Order Exception</b>\n"
+        #     f"<b>Order:</b> {order_id}\n"
+        #     f"<b>Customer:</b> {request.customer_name} / {request.customer_phone}\n"
+        #     f"<b>Error:</b> {str(exc)[:300]}"
+        # )
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/orders/{order_id}")
 async def get_order(order_id: str, db: Session = Depends(get_db)):
