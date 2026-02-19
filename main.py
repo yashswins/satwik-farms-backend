@@ -423,8 +423,12 @@ async def create_order(
         if discount > 0:
             accu360_payload["apply_discount_on"] = "Grand Total"
             accu360_payload["discount_amount"] = discount
+        # Note: do NOT pass coupon_code — Frappe validates it against its own
+        # Coupon Code doctype, which doesn't know about our app's promo codes.
+        # Include it in instructions for visibility instead.
         if request.promo_code:
-            accu360_payload["coupon_code"] = request.promo_code
+            promo_note = f" | Promo: {request.promo_code} (-TSH {discount:,.0f})"
+            accu360_payload["instructions"] = (request.delivery_notes or "") + promo_note
 
         # Submit to Accu360 (Frappe API)
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -443,6 +447,7 @@ async def create_order(
                 or response.text.strip()
                 or "Accu360 rejected the order"
             )
+            print(f"ERROR: Accu360 rejected order {order_id} [{response.status_code}]: {response.text[:500]}")
             raise HTTPException(status_code=502, detail=f"Accu360 error: {error_detail}")
 
         accu360_data = safe_response_json(response)
