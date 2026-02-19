@@ -76,6 +76,8 @@ class CreateOrderRequest(BaseModel):
     delivery_fee: float
     total: float
     delivery_notes: Optional[str] = None
+    discount: Optional[float] = 0.0
+    promo_code: Optional[str] = None
 
 class WebhookPayload(BaseModel):
     event: str
@@ -398,6 +400,7 @@ async def create_order(
         )
 
         # Build Frappe Sales Order payload
+        discount = request.discount or 0.0
         accu360_payload = {
             "doctype": "Sales Order",
             "customer": customer_id,
@@ -417,6 +420,9 @@ async def create_order(
             "contact_phone": request.customer_phone,
             "instructions": request.delivery_notes or ""
         }
+        if discount > 0:
+            accu360_payload["apply_discount_on"] = "Grand Total"
+            accu360_payload["discount_amount"] = discount
 
         # Submit to Accu360 (Frappe API)
         async with httpx.AsyncClient(timeout=30.0) as client:
