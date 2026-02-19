@@ -423,6 +423,8 @@ async def create_order(
         if discount > 0:
             accu360_payload["apply_discount_on"] = "Grand Total"
             accu360_payload["discount_amount"] = discount
+        if request.promo_code:
+            accu360_payload["coupon_code"] = request.promo_code
 
         # Submit to Accu360 (Frappe API)
         async with httpx.AsyncClient(timeout=30.0) as client:
