@@ -19,15 +19,15 @@ ACCU360_API_SECRET = os.getenv("ACCU360_API_SECRET")
 ACCU360_API_BASE_URL = os.getenv("ACCU360_API_BASE_URL")
 ACCU360_DEFAULT_CITY = os.getenv("ACCU360_DEFAULT_CITY")
 ACCU360_DEFAULT_PROVINCE = os.getenv("ACCU360_DEFAULT_PROVINCE")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "your-webhook-secret")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# API Authentication - Add these keys from your Android app
-VALID_API_KEYS = [
-    os.getenv("APP_API_KEY_DEBUG", "fa2582e2af1c20de90daf3e7fbfde118bd580c99c747e4de5d9556282dc77f59"),
-    os.getenv("APP_API_KEY_RELEASE", "49f8ba687c8af783d5307e314421da6e2f84d0ac961339bc75cb4fee5d6b487c"),
-]
+# API Authentication - set APP_API_KEY_DEBUG and APP_API_KEY_RELEASE in environment
+VALID_API_KEYS = [k for k in [
+    os.getenv("APP_API_KEY_DEBUG"),
+    os.getenv("APP_API_KEY_RELEASE"),
+] if k]
 
 # Database Setup
 engine = create_engine(
