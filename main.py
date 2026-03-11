@@ -351,7 +351,8 @@ async def create_shipping_address(
 async def health():
     return {
         "status": "healthy",
-        "accu360_configured": bool(ACCU360_API_KEY and ACCU360_API_SECRET)
+        "accu360_configured": bool(ACCU360_API_KEY and ACCU360_API_SECRET),
+        "api_keys_configured": len(VALID_API_KEYS) > 0
     }
 
 @app.post("/orders")
