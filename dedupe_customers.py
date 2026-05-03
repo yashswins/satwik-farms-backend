@@ -68,6 +68,50 @@ def extract_phone_key(customer):
     return ""
 
 
+def keep_priority(customer):
+    """Rank within a duplicate group: prefer cleanest customer_name format.
+
+    3 = customer_name starts with '+' (full E.164, e.g. '+255678406696')
+    2 = customer_name is digits-only (e.g. '0678406696', '255678406696')
+    1 = customer_name contains letters (it's a person/business name)
+    0 = customer_name is empty
+    """
+    name = (customer.get("customer_name") or "").strip()
+    if not name:
+        return 0
+    has_letters = bool(re.search(r"[A-Za-z]", name))
+    if name.startswith("+") and not has_letters:
+        return 3
+    if not has_letters:
+        return 2
+    return 1
+
+
+def sort_key(customer):
+    """Sort key for picking the canonical record in a duplicate group.
+    Sorting reverse=True with this key gives: highest priority first,
+    then newest creation as tie-break."""
+    return (keep_priority(customer), customer.get("creation") or "")
+
+
+def is_text_only(customer):
+    """True if customer_name contains letters (i.e. it's a name, not a phone).
+    These are test records left over from earlier app-buggy code paths and
+    get deleted outright by the script."""
+    name = (customer.get("customer_name") or "").strip()
+    return bool(name) and bool(re.search(r"[A-Za-z]", name))
+
+
+def delete_customer(client, name):
+    """Hard-delete a Customer via REST. Frappe will refuse if any
+    submitted/linked transactions reference it; caller inspects status."""
+    return client.delete(
+        f"{ACCU360_API_BASE_URL}/api/resource/Customer/{name}",
+        headers=HEADERS,
+        timeout=60.0,
+    )
+
+
 def fetch_all_customers(client):
     """Fetch every Customer record, paginating through Frappe's REST API."""
     customers = []
@@ -169,11 +213,16 @@ def main():
                     "creation",
                     "merge_target",
                 ])
+                # Track which records get merged in pass 1 so we don't
+                # double-list them as deletes in pass 2 below.
+                merge_planned = set()
                 for last9_key, group in sorted(duplicates.items()):
-                    sorted_group = sorted(
-                        group, key=lambda c: c.get("creation") or "", reverse=True
-                    )
+                    sorted_group = sorted(group, key=sort_key, reverse=True)
                     canonical = sorted_group[0]
+                    if is_text_only(canonical):
+                        # All-text-only group — pass 1 will skip; all rows
+                        # get listed under "delete" below.
+                        continue
                     writer.writerow([
                         last9_key,
                         "keep",
@@ -186,6 +235,7 @@ def main():
                         "",
                     ])
                     for dup in sorted_group[1:]:
+                        merge_planned.add(dup["name"])
                         writer.writerow([
                             last9_key,
                             "merge",
@@ -197,14 +247,41 @@ def main():
                             dup.get("creation", ""),
                             canonical.get("name", ""),
                         ])
+
+                # Append "delete" rows for every text-only record that
+                # won't be absorbed by a merge (i.e. test data).
+                for c in customers:
+                    if c["name"] in merge_planned:
+                        continue
+                    if not is_text_only(c):
+                        continue
+                    writer.writerow([
+                        extract_phone_key(c),
+                        "delete",
+                        c.get("name", ""),
+                        c.get("customer_name", ""),
+                        c.get("customer_full_name", ""),
+                        c.get("mobile_no", ""),
+                        c.get("mobile_number", ""),
+                        c.get("creation", ""),
+                        "",
+                    ])
             print(f"Wrote duplicate report to {args.csv}\n")
 
+        # ── PASS 1: merge duplicates that have a non-text-only canonical.
+        #    Groups where every member has a text-only customer_name are
+        #    skipped here and handled entirely by pass 2 (delete).
+        print("=== Pass 1: merging duplicates ===\n")
         merged = 0
-        failed = 0
+        merge_failed = 0
+        merged_names = set()
         for last9_key, group in duplicates.items():
-            # Newest first — by creation date desc.
-            group.sort(key=lambda c: c.get("creation") or "", reverse=True)
+            # Sort: cleanest customer_name format first, newest as tie-breaker.
+            group.sort(key=sort_key, reverse=True)
             canonical = group[0]
+            if is_text_only(canonical):
+                # Whole group is test/text-only — skip merging, pass 2 deletes them.
+                continue
             dups = group[1:]
             print(
                 f"Phone ...{last9_key}: keeping {canonical['name']} "
@@ -225,18 +302,59 @@ def main():
                         if resp.status_code == 200:
                             print("    [ok] merged")
                             merged += 1
+                            merged_names.add(dup["name"])
                         else:
-                            print(f"    [fail] failed [{resp.status_code}]: {resp.text[:300]}")
-                            failed += 1
+                            print(f"    [fail] [{resp.status_code}]: {resp.text[:300]}")
+                            merge_failed += 1
                     except Exception as e:
                         print(f"    [fail] exception: {e}")
-                        failed += 1
+                        merge_failed += 1
+                else:
+                    merged_names.add(dup["name"])  # for pass 2's "remaining" calc
             print()
 
+        # ── PASS 2: delete every customer whose customer_name is text-only
+        #    and that wasn't already merged-away in pass 1. These are the
+        #    leftover test records (Naman Test, Abhishek Kumar, Vinod Varma,
+        #    etc.) the user wants gone. Frappe will refuse the DELETE if
+        #    submitted Sales Orders / Invoices reference the customer; those
+        #    failures get printed for manual cleanup.
+        print("=== Pass 2: deleting remaining text-only records ===\n")
+        text_only_to_delete = [
+            c for c in customers
+            if c["name"] not in merged_names and is_text_only(c)
+        ]
+        print(f"{len(text_only_to_delete)} text-only customer_name records remain after pass 1.\n")
+        deleted = 0
+        delete_failed = 0
+        for c in text_only_to_delete:
+            arrow = "would delete" if not args.apply else "deleting"
+            print(
+                f"  - {arrow} {c['name']} "
+                f"customer_name={c.get('customer_name', '?')!r} "
+                f"customer_full_name={c.get('customer_full_name', '?')!r}"
+            )
+            if args.apply:
+                try:
+                    resp = delete_customer(client, c["name"])
+                    if resp.status_code in (200, 202):
+                        print("    [ok] deleted")
+                        deleted += 1
+                    else:
+                        print(f"    [fail] [{resp.status_code}]: {resp.text[:300]}")
+                        delete_failed += 1
+                except Exception as e:
+                    print(f"    [fail] exception: {e}")
+                    delete_failed += 1
+
+        print()
         if args.apply:
-            print(f"Done. Merged: {merged}, Failed: {failed}")
+            print(
+                f"Done. Merged: {merged} (failed: {merge_failed}). "
+                f"Deleted: {deleted} (failed: {delete_failed})."
+            )
         else:
-            print("Dry-run complete. Re-run with --apply to perform the merges.")
+            print("Dry-run complete. Re-run with --apply to perform the merges and deletes.")
 
 
 if __name__ == "__main__":
