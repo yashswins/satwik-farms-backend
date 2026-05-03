@@ -246,6 +246,12 @@ async def _create_primary_contact(
         "doctype": "Contact",
         "first_name": first_name,
         "last_name": last_name,
+        # Set top-level mobile_no/phone explicitly. Frappe is supposed to
+        # auto-fetch these from the primary phone_nos entry, but via REST
+        # the fetch doesn't reliably persist — leaving these blank breaks
+        # later searches that filter on Contact.mobile_no/phone.
+        "mobile_no": customer_phone,
+        "phone": customer_phone,
         "phone_nos": [
             {
                 "phone": customer_phone,
@@ -330,7 +336,11 @@ async def find_or_create_customer(
                     ):
                         return cust.get("name", customer_name)
 
-            # 2. Fallback: search Contact, then verify and follow dynamic_link
+            # 2. Fallback A: search Contact's top-level mobile_no/phone fields.
+            #    Then fallback B: search the Contact Phone child doctype directly
+            #    (always populated even when top-level fields don't persist via REST).
+            contact_names_to_check: list[str] = []
+
             contact_resp = await client.get(
                 f"{ACCU360_API_BASE_URL}/api/resource/Contact",
                 headers=auth_headers,
@@ -344,32 +354,49 @@ async def find_or_create_customer(
                 },
             )
             if contact_resp.status_code == 200:
-                for contact in safe_response_json(contact_resp).get("data", []) or []:
-                    contact_name = contact.get("name")
-                    if not contact_name:
-                        continue
-                    detail = await client.get(
-                        f"{ACCU360_API_BASE_URL}/api/resource/Contact/{contact_name}",
-                        headers=auth_headers,
-                    )
-                    if detail.status_code != 200:
-                        continue
-                    contact_doc = safe_response_json(detail).get("data", {}) or {}
+                for c in safe_response_json(contact_resp).get("data", []) or []:
+                    if c.get("name"):
+                        contact_names_to_check.append(c["name"])
 
-                    # Strict re-verification: any phone on this contact must
-                    # actually normalise to the same last-9 as the input.
-                    candidate_phones = [
-                        contact_doc.get("mobile_no"),
-                        contact_doc.get("phone"),
-                    ]
-                    for entry in contact_doc.get("phone_nos", []) or []:
-                        candidate_phones.append(entry.get("phone"))
-                    if not any(_phone_matches(p, last9) for p in candidate_phones):
-                        continue  # false positive from substring LIKE — skip
+            # Search Contact Phone child table — robust because phone_nos always persists.
+            phone_resp = await client.get(
+                f"{ACCU360_API_BASE_URL}/api/resource/Contact Phone",
+                headers=auth_headers,
+                params={
+                    "filters": json.dumps([["phone", "like", needle]]),
+                    "fields": json.dumps(["parent", "phone"]),
+                    "limit_page_length": 20,
+                },
+            )
+            if phone_resp.status_code == 200:
+                for entry in safe_response_json(phone_resp).get("data", []) or []:
+                    parent = entry.get("parent")
+                    if parent and parent not in contact_names_to_check:
+                        contact_names_to_check.append(parent)
 
-                    for link in contact_doc.get("links", []) or []:
-                        if link.get("link_doctype") == "Customer" and link.get("link_name"):
-                            return link["link_name"]
+            for contact_name in contact_names_to_check:
+                detail = await client.get(
+                    f"{ACCU360_API_BASE_URL}/api/resource/Contact/{contact_name}",
+                    headers=auth_headers,
+                )
+                if detail.status_code != 200:
+                    continue
+                contact_doc = safe_response_json(detail).get("data", {}) or {}
+
+                # Strict re-verification: any phone on this contact must
+                # actually normalise to the same last-9 as the input.
+                candidate_phones = [
+                    contact_doc.get("mobile_no"),
+                    contact_doc.get("phone"),
+                ]
+                for entry in contact_doc.get("phone_nos", []) or []:
+                    candidate_phones.append(entry.get("phone"))
+                if not any(_phone_matches(p, last9) for p in candidate_phones):
+                    continue  # false positive from substring LIKE — skip
+
+                for link in contact_doc.get("links", []) or []:
+                    if link.get("link_doctype") == "Customer" and link.get("link_name"):
+                        return link["link_name"]
 
         # Customer not found - create new one
         new_customer = {
