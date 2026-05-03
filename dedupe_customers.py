@@ -19,6 +19,7 @@ the environment (or .env in the same directory).
 import os
 import re
 import sys
+import csv
 import argparse
 import httpx
 from dotenv import load_dotenv
@@ -120,6 +121,11 @@ def main():
         action="store_true",
         help="Actually perform merges (default is dry-run).",
     )
+    parser.add_argument(
+        "--csv",
+        metavar="PATH",
+        help="Write every duplicate group to a CSV at PATH for review.",
+    )
     args = parser.parse_args()
 
     mode = "APPLY" if args.apply else "DRY-RUN"
@@ -148,6 +154,50 @@ def main():
         if not duplicates:
             print("Nothing to do.")
             return
+
+        if args.csv:
+            with open(args.csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "phone_last9",
+                    "action",
+                    "customer_id",
+                    "customer_name",
+                    "customer_full_name",
+                    "mobile_no",
+                    "mobile_number",
+                    "creation",
+                    "merge_target",
+                ])
+                for last9_key, group in sorted(duplicates.items()):
+                    sorted_group = sorted(
+                        group, key=lambda c: c.get("creation") or "", reverse=True
+                    )
+                    canonical = sorted_group[0]
+                    writer.writerow([
+                        last9_key,
+                        "keep",
+                        canonical.get("name", ""),
+                        canonical.get("customer_name", ""),
+                        canonical.get("customer_full_name", ""),
+                        canonical.get("mobile_no", ""),
+                        canonical.get("mobile_number", ""),
+                        canonical.get("creation", ""),
+                        "",
+                    ])
+                    for dup in sorted_group[1:]:
+                        writer.writerow([
+                            last9_key,
+                            "merge",
+                            dup.get("name", ""),
+                            dup.get("customer_name", ""),
+                            dup.get("customer_full_name", ""),
+                            dup.get("mobile_no", ""),
+                            dup.get("mobile_number", ""),
+                            dup.get("creation", ""),
+                            canonical.get("name", ""),
+                        ])
+            print(f"Wrote duplicate report to {args.csv}\n")
 
         merged = 0
         failed = 0

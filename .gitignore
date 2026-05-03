@@ -21,6 +21,9 @@ ENV/
 *.db
 *.sqlite3
 
+# Local data dumps (may contain customer PII)
+*.csv
+
 # OS
 .DS_Store
 Thumbs.db
