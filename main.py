@@ -688,6 +688,7 @@ async def create_order(
         delivery_date = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
 
         so_items = []
+        total_net_weight = 0.0
         for item in request.items:
             weight_per_unit_kg = parse_weight_per_unit_kg(item.unit)
             if weight_per_unit_kg and weight_per_unit_kg > 0:
@@ -695,12 +696,20 @@ async def create_order(
                 # rebase rate to per-kg so the line total stays equal to quantity * unit_price.
                 qty_kg = item.quantity * weight_per_unit_kg
                 rate_per_kg = item.unit_price / weight_per_unit_kg
+                # Frappe's accounts_controller.calculate_total_weight() doesn't fire
+                # in this accu360 build (or fires with no effect), so total_weight
+                # silently stays 0 even when weight_per_unit and qty are correct.
+                # Send total_weight explicitly so it persists; we also set
+                # total_net_weight on the SO header for the same reason.
+                line_total_weight = qty_kg
+                total_net_weight += line_total_weight
                 so_items.append({
                     "item_code": item.accu360_sku,
                     "qty": qty_kg,
                     "rate": rate_per_kg,
                     "weight_per_unit": 1,
                     "weight_uom": "Kg",
+                    "total_weight": line_total_weight,
                     "delivery_date": delivery_date,
                 })
             else:
@@ -719,12 +728,7 @@ async def create_order(
             "customer_address": shipping_address_name,
             "shipping_address_name": shipping_address_name,
             "items": so_items,
-            # Frappe's per-item total_weight is calculated as qty * weight_per_unit
-            # only when the line's weight_uom matches the SO header's weight_uom;
-            # otherwise it tries a UoM conversion that fails to zero. Setting the
-            # header's weight_uom to Kg makes the multiplication path fire for our
-            # weighted line items (which all carry weight_uom=Kg).
-            "weight_uom": "Kg",
+            "total_net_weight": total_net_weight,
             "contact_phone": request.customer_phone,
             "instructions": request.delivery_notes or ""
         }
