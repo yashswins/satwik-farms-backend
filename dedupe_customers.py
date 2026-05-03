@@ -157,7 +157,7 @@ def main():
             canonical = group[0]
             dups = group[1:]
             print(
-                f"Phone …{last9_key}: keeping {canonical['name']} "
+                f"Phone ...{last9_key}: keeping {canonical['name']} "
                 f"(created {canonical.get('creation', '?')}, "
                 f"customer_name={canonical.get('customer_name', '?')!r})"
             )
@@ -167,19 +167,19 @@ def main():
                     f"  - {arrow} {dup['name']} "
                     f"(created {dup.get('creation', '?')}, "
                     f"customer_name={dup.get('customer_name', '?')!r}) "
-                    f"→ {canonical['name']}"
+                    f"-> {canonical['name']}"
                 )
                 if args.apply:
                     try:
                         resp = merge_customer(client, dup["name"], canonical["name"])
                         if resp.status_code == 200:
-                            print("    ✓ merged")
+                            print("    [ok] merged")
                             merged += 1
                         else:
-                            print(f"    ✗ failed [{resp.status_code}]: {resp.text[:300]}")
+                            print(f"    [fail] failed [{resp.status_code}]: {resp.text[:300]}")
                             failed += 1
                     except Exception as e:
-                        print(f"    ✗ exception: {e}")
+                        print(f"    [fail] exception: {e}")
                         failed += 1
             print()
 
