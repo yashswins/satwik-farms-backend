@@ -505,12 +505,72 @@ async def sync_customer_fields(
             json=update_payload
         )
 
+def _normalize_address_text(s: Optional[str]) -> str:
+    """Lowercase + collapse whitespace for fuzzy address comparison."""
+    if not s:
+        return ""
+    return " ".join(s.lower().split())
+
+
+async def _find_existing_address(
+    client: httpx.AsyncClient,
+    auth_headers: dict,
+    customer_id: str,
+    customer_address: str,
+) -> Optional[str]:
+    """Return the name of an Address linked to this Customer whose address_line1
+    matches the input (case/whitespace insensitive), or None if no such record."""
+    target = _normalize_address_text(customer_address)
+    if not target:
+        return None
+    response = await client.get(
+        f"{ACCU360_API_BASE_URL}/api/resource/Address",
+        headers=auth_headers,
+        params={
+            "filters": json.dumps([
+                ["Dynamic Link", "link_doctype", "=", "Customer"],
+                ["Dynamic Link", "link_name", "=", customer_id],
+            ]),
+            "fields": json.dumps(["name", "address_line1"]),
+            "limit_page_length": 50,
+        },
+    )
+    if response.status_code != 200:
+        return None
+    for addr in safe_response_json(response).get("data", []) or []:
+        if _normalize_address_text(addr.get("address_line1")) == target:
+            return addr.get("name")
+    return None
+
+
+async def _set_primary_address(
+    client: httpx.AsyncClient,
+    auth_headers: dict,
+    customer_id: str,
+    address_name: str,
+) -> None:
+    """Point the customer's primary address at this Address. Best-effort —
+    a failure here is non-fatal to order placement."""
+    try:
+        await client.put(
+            f"{ACCU360_API_BASE_URL}/api/resource/Customer/{customer_id}",
+            headers=auth_headers,
+            json={"customer_primary_address": address_name},
+        )
+    except Exception as e:
+        print(f"WARNING: set primary address failed for {customer_id}: {e}")
+
+
 async def create_shipping_address(
     customer_id: str,
     customer_name: str,
     customer_phone: str,
     customer_address: str
 ) -> str:
+    """Reuse an existing Address with matching address_line1 for this Customer
+    if one exists, otherwise create a new one. Either way, the Customer's
+    customer_primary_address is updated to point at the resolved Address so a
+    glance at the Customer record shows their current shipping address."""
     if not ACCU360_DEFAULT_CITY or not ACCU360_DEFAULT_PROVINCE:
         raise HTTPException(
             status_code=500,
@@ -518,23 +578,30 @@ async def create_shipping_address(
         )
 
     auth_headers = get_accu360_auth_header()
-    address_payload = {
-        "doctype": "Address",
-        "address_title": customer_name,
-        "address_type": "Shipping",
-        "address_line1": customer_address,
-        "city": ACCU360_DEFAULT_CITY,
-        "province": ACCU360_DEFAULT_PROVINCE,
-        "phone": customer_phone,
-        "links": [
-            {
-                "link_doctype": "Customer",
-                "link_name": customer_id
-            }
-        ]
-    }
 
     async with httpx.AsyncClient(timeout=30.0) as client:
+        existing = await _find_existing_address(
+            client, auth_headers, customer_id, customer_address
+        )
+        if existing:
+            await _set_primary_address(client, auth_headers, customer_id, existing)
+            return existing
+
+        address_payload = {
+            "doctype": "Address",
+            "address_title": customer_name,
+            "address_type": "Shipping",
+            "address_line1": customer_address,
+            "city": ACCU360_DEFAULT_CITY,
+            "province": ACCU360_DEFAULT_PROVINCE,
+            "phone": customer_phone,
+            "links": [
+                {
+                    "link_doctype": "Customer",
+                    "link_name": customer_id
+                }
+            ]
+        }
         response = await client.post(
             f"{ACCU360_API_BASE_URL}/api/resource/Address",
             headers=auth_headers,
@@ -548,6 +615,7 @@ async def create_shipping_address(
                 or created.get("name")
             )
             if address_name:
+                await _set_primary_address(client, auth_headers, customer_id, address_name)
                 return address_name
 
         error_data = safe_response_json(response)
