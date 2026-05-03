@@ -315,23 +315,30 @@ async def find_or_create_customer(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         if needle:
-            # 1. Search Customer doctype directly
+            # 1. Primary search: Customer.customer_name. In this Frappe instance the
+            #    field labelled "Mobile Number" on Customer has DB fieldname
+            #    customer_name (legacy from how manual entries were set up). Manually-
+            #    created customers have customer_name = phone, so this search hits
+            #    them. We also write customer_name = phone on create going forward.
+            #    Also include mobile_no / mobile_number as additional matches.
             customer_resp = await client.get(
                 f"{ACCU360_API_BASE_URL}/api/resource/Customer",
                 headers=auth_headers,
                 params={
                     "or_filters": json.dumps([
+                        ["customer_name", "like", needle],
                         ["mobile_no", "like", needle],
                         ["mobile_number", "like", needle],
                     ]),
                     "fields": json.dumps(["name", "customer_name", "mobile_no", "mobile_number"]),
-                    "limit_page_length": 5,
+                    "limit_page_length": 10,
                 },
             )
             if customer_resp.status_code == 200:
                 for cust in safe_response_json(customer_resp).get("data", []) or []:
                     if (
-                        _phone_matches(cust.get("mobile_no"), last9)
+                        _phone_matches(cust.get("customer_name"), last9)
+                        or _phone_matches(cust.get("mobile_no"), last9)
                         or _phone_matches(cust.get("mobile_number"), last9)
                     ):
                         return cust.get("name", customer_name)
@@ -398,10 +405,14 @@ async def find_or_create_customer(
                     if link.get("link_doctype") == "Customer" and link.get("link_name"):
                         return link["link_name"]
 
-        # Customer not found - create new one
+        # Customer not found - create new one. Store the phone number in
+        # customer_name (matches the convention used for manual entries in this
+        # Frappe instance — the field labelled "Mobile Number" is fieldname
+        # customer_name). The actual person/business name goes into
+        # customer_full_name. mobile_no/mobile_number are also set for redundancy.
         new_customer = {
             "doctype": "Customer",
-            "customer_name": customer_name,
+            "customer_name": customer_phone,
             "customer_type": "Individual",
             "customer_group": "Individual",
             "territory": "All Territories",
@@ -455,19 +466,21 @@ async def sync_customer_fields(
 
         should_update = (
             not current_full_name
+            or not current_mobile_no
             or not current_mobile_number
-            or current_mobile_number == current_customer_name
-            or current_mobile_number == current_full_name
+            or not _phone_matches(current_customer_name, normalize_phone_digits(customer_phone)[-9:])
         )
 
         if not should_update:
             return
 
+        # NOTE: customer_name = phone (matches the manual-entry convention in
+        # this Frappe instance), customer_full_name = the actual person name.
         update_payload = {
             "customer_full_name": customer_name,
             "mobile_number": customer_phone,
             "mobile_no": customer_phone,
-            "customer_name": customer_name
+            "customer_name": customer_phone,
         }
 
         await client.put(
