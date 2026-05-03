@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional
@@ -220,6 +221,65 @@ def save_order_to_db(
         except Exception:
             pass
 
+def _phone_matches(candidate: Optional[str], input_last9: str) -> bool:
+    """True if a candidate phone string normalises to the same last-9 digits as input."""
+    if not candidate or not input_last9:
+        return False
+    cand_digits = normalize_phone_digits(candidate)
+    return cand_digits.endswith(input_last9)
+
+async def _create_primary_contact(
+    client: httpx.AsyncClient,
+    auth_headers: dict,
+    customer_id: str,
+    customer_name: str,
+    customer_phone: str,
+) -> Optional[str]:
+    """Create a Contact linked to the Customer with the phone, and set it as the
+    customer's primary contact so Customer.mobile_no auto-populates from it.
+    Returns the Contact name on success, None on failure (non-fatal)."""
+    name_parts = (customer_name or "Customer").strip().split(maxsplit=1)
+    first_name = name_parts[0] if name_parts else "Customer"
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    contact_payload = {
+        "doctype": "Contact",
+        "first_name": first_name,
+        "last_name": last_name,
+        "phone_nos": [
+            {
+                "phone": customer_phone,
+                "is_primary_phone": 1,
+                "is_primary_mobile_no": 1,
+            }
+        ],
+        "links": [
+            {"link_doctype": "Customer", "link_name": customer_id}
+        ],
+    }
+    try:
+        resp = await client.post(
+            f"{ACCU360_API_BASE_URL}/api/resource/Contact",
+            headers=auth_headers,
+            json=contact_payload,
+        )
+        if resp.status_code not in [200, 201]:
+            print(f"WARNING: Contact create failed for {customer_id}: [{resp.status_code}] {resp.text[:200]}")
+            return None
+        contact_name = safe_response_json(resp).get("data", {}).get("name")
+        if not contact_name:
+            return None
+        # Set as primary contact on the Customer so mobile_no fetches from it
+        await client.put(
+            f"{ACCU360_API_BASE_URL}/api/resource/Customer/{customer_id}",
+            headers=auth_headers,
+            json={"customer_primary_contact": contact_name, "mobile_no": customer_phone},
+        )
+        return contact_name
+    except Exception as e:
+        print(f"WARNING: Contact link failed for {customer_id}: {e}")
+        return None
+
 async def find_or_create_customer(
     customer_name: str,
     customer_phone: str,
@@ -228,64 +288,86 @@ async def find_or_create_customer(
     """Find existing customer by phone or create new one. Returns customer name for Sales Order.
 
     Search strategy (in order):
-      1. Customer doctype on `mobile_no` OR `mobile_number` (last-9-digits LIKE)
-      2. Contact doctype on `mobile_no` OR `phone`, then follow dynamic_link → Customer
-    Frappe doesn't always persist mobile_no on the Customer doc directly (it can live
-    only on the linked Contact), so a Customer-only search misses existing records and
-    creates duplicates. The Contact fallback catches that case.
+      1. Customer doctype on `mobile_no` OR `mobile_number` (last-9 digits LIKE).
+      2. Fallback: Contact doctype on `mobile_no` OR `phone`, with strict
+         re-verification of the contact's actual phone (normalised last-9 must
+         match exactly) before following dynamic_link → Customer. The strict
+         re-check prevents false matches from old/stale contacts.
+    On miss, creates a new Customer + a primary Contact so future searches hit
+    Customer.mobile_no directly (Frappe fetches that field from the linked
+    primary contact, not from the Customer doc itself).
+
+    Filters are passed via httpx `params=` so '%' in LIKE patterns is properly
+    URL-encoded (string-interpolating into the URL silently mangled the filter
+    because '%XX' was interpreted as percent-encoding).
     """
 
     auth_headers = get_accu360_auth_header()
     digits = normalize_phone_digits(customer_phone)
     last9 = digits[-9:] if len(digits) >= 9 else digits
+    needle = f"%{last9}%" if last9 else None
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # 1. Search Customer doctype on both mobile_no and mobile_number
-        if last9:
-            customer_or_filters = (
-                f'[["mobile_no","like","%{last9}%"],'
-                f'["mobile_number","like","%{last9}%"]]'
+        if needle:
+            # 1. Search Customer doctype directly
+            customer_resp = await client.get(
+                f"{ACCU360_API_BASE_URL}/api/resource/Customer",
+                headers=auth_headers,
+                params={
+                    "or_filters": json.dumps([
+                        ["mobile_no", "like", needle],
+                        ["mobile_number", "like", needle],
+                    ]),
+                    "fields": json.dumps(["name", "customer_name", "mobile_no", "mobile_number"]),
+                    "limit_page_length": 5,
+                },
             )
-            customer_url = (
-                f"{ACCU360_API_BASE_URL}/api/resource/Customer"
-                f"?or_filters={customer_or_filters}"
-                f"&fields=[\"name\",\"customer_name\",\"mobile_no\",\"mobile_number\"]"
-                f"&limit_page_length=1"
-            )
-            response = await client.get(customer_url, headers=auth_headers)
-            if response.status_code == 200:
-                data = safe_response_json(response)
-                customers = data.get("data", [])
-                if customers:
-                    return customers[0].get("name", customer_name)
+            if customer_resp.status_code == 200:
+                for cust in safe_response_json(customer_resp).get("data", []) or []:
+                    if (
+                        _phone_matches(cust.get("mobile_no"), last9)
+                        or _phone_matches(cust.get("mobile_number"), last9)
+                    ):
+                        return cust.get("name", customer_name)
 
-            # 2. Fallback: search Contact, then follow dynamic_link to Customer
-            contact_or_filters = (
-                f'[["mobile_no","like","%{last9}%"],'
-                f'["phone","like","%{last9}%"]]'
+            # 2. Fallback: search Contact, then verify and follow dynamic_link
+            contact_resp = await client.get(
+                f"{ACCU360_API_BASE_URL}/api/resource/Contact",
+                headers=auth_headers,
+                params={
+                    "or_filters": json.dumps([
+                        ["mobile_no", "like", needle],
+                        ["phone", "like", needle],
+                    ]),
+                    "fields": json.dumps(["name"]),
+                    "limit_page_length": 10,
+                },
             )
-            contact_url = (
-                f"{ACCU360_API_BASE_URL}/api/resource/Contact"
-                f"?or_filters={contact_or_filters}"
-                f"&fields=[\"name\"]"
-                f"&limit_page_length=5"
-            )
-            contact_response = await client.get(contact_url, headers=auth_headers)
-            if contact_response.status_code == 200:
-                contact_data = safe_response_json(contact_response)
-                for contact in contact_data.get("data", []):
+            if contact_resp.status_code == 200:
+                for contact in safe_response_json(contact_resp).get("data", []) or []:
                     contact_name = contact.get("name")
                     if not contact_name:
                         continue
-                    # Fetch the full Contact to read its links
                     detail = await client.get(
                         f"{ACCU360_API_BASE_URL}/api/resource/Contact/{contact_name}",
                         headers=auth_headers,
                     )
                     if detail.status_code != 200:
                         continue
-                    links = safe_response_json(detail).get("data", {}).get("links", []) or []
-                    for link in links:
+                    contact_doc = safe_response_json(detail).get("data", {}) or {}
+
+                    # Strict re-verification: any phone on this contact must
+                    # actually normalise to the same last-9 as the input.
+                    candidate_phones = [
+                        contact_doc.get("mobile_no"),
+                        contact_doc.get("phone"),
+                    ]
+                    for entry in contact_doc.get("phone_nos", []) or []:
+                        candidate_phones.append(entry.get("phone"))
+                    if not any(_phone_matches(p, last9) for p in candidate_phones):
+                        continue  # false positive from substring LIKE — skip
+
+                    for link in contact_doc.get("links", []) or []:
                         if link.get("link_doctype") == "Customer" and link.get("link_name"):
                             return link["link_name"]
 
@@ -294,8 +376,8 @@ async def find_or_create_customer(
             "doctype": "Customer",
             "customer_name": customer_name,
             "customer_type": "Individual",
-            "customer_group": "Individual",  # Adjust if your system uses different groups
-            "territory": "All Territories",  # Adjust to your territory
+            "customer_group": "Individual",
+            "territory": "All Territories",
             "mobile_no": customer_phone,
             "customer_full_name": customer_name,
             "mobile_number": customer_phone,
@@ -309,8 +391,13 @@ async def find_or_create_customer(
 
         if create_response.status_code in [200, 201]:
             created = safe_response_json(create_response)
-            # Return the new customer's name (ID)
-            return created.get("data", {}).get("name", customer_name)
+            customer_id = created.get("data", {}).get("name", customer_name)
+            # Create a primary Contact so mobile_no on Customer populates and
+            # subsequent direct-Customer searches find this record.
+            await _create_primary_contact(
+                client, auth_headers, customer_id, customer_name, customer_phone
+            )
+            return customer_id
         else:
             # If customer creation fails, try using customer_name directly
             # (in case it matches an existing customer)
