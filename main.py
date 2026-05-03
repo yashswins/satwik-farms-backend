@@ -719,6 +719,12 @@ async def create_order(
             "customer_address": shipping_address_name,
             "shipping_address_name": shipping_address_name,
             "items": so_items,
+            # Frappe's per-item total_weight is calculated as qty * weight_per_unit
+            # only when the line's weight_uom matches the SO header's weight_uom;
+            # otherwise it tries a UoM conversion that fails to zero. Setting the
+            # header's weight_uom to Kg makes the multiplication path fire for our
+            # weighted line items (which all carry weight_uom=Kg).
+            "weight_uom": "Kg",
             "contact_phone": request.customer_phone,
             "instructions": request.delivery_notes or ""
         }
