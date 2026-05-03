@@ -1,4 +1,5 @@
 import os
+import re
 import httpx
 from datetime import datetime, timedelta
 from typing import Optional
@@ -66,6 +67,7 @@ class OrderItem(BaseModel):
     quantity: int
     unit_price: float
     total_price: float
+    unit: Optional[str] = None
 
 class CreateOrderRequest(BaseModel):
     customer_name: str
@@ -141,6 +143,33 @@ def safe_response_json(response: httpx.Response) -> dict:
     except ValueError:
         return {}
 
+# Matches "0.5 Kg", "1Kg", "250 gram", "500g", "1 grams" etc. Case-insensitive.
+_WEIGHT_UNIT_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(kg|g|gram|grams)\s*$",
+    re.IGNORECASE,
+)
+
+def parse_weight_per_unit_kg(unit: Optional[str]) -> Optional[float]:
+    """Parse a unit string like '0.5 Kg' or '250 gram' into weight-per-unit in kg.
+    Returns None for non-weighted units (bunch, piece, liter, no, etc.) or unparsable values."""
+    if not unit:
+        return None
+    match = _WEIGHT_UNIT_RE.match(unit)
+    if not match:
+        return None
+    value = float(match.group(1))
+    suffix = match.group(2).lower()
+    if suffix == "kg":
+        return value
+    # g / gram / grams
+    return value / 1000.0
+
+def normalize_phone_digits(phone: Optional[str]) -> str:
+    """Strip non-digits from a phone string."""
+    if not phone:
+        return ""
+    return re.sub(r"\D", "", phone)
+
 # async def send_telegram(message: str) -> None:
 #     """Send a Telegram notification to the shop owner. Never raises."""
 #     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -196,26 +225,69 @@ async def find_or_create_customer(
     customer_phone: str,
     customer_address: str
 ) -> str:
-    """Find existing customer by phone or create new one. Returns customer name for Sales Order."""
+    """Find existing customer by phone or create new one. Returns customer name for Sales Order.
+
+    Search strategy (in order):
+      1. Customer doctype on `mobile_no` OR `mobile_number` (last-9-digits LIKE)
+      2. Contact doctype on `mobile_no` OR `phone`, then follow dynamic_link → Customer
+    Frappe doesn't always persist mobile_no on the Customer doc directly (it can live
+    only on the linked Contact), so a Customer-only search misses existing records and
+    creates duplicates. The Contact fallback catches that case.
+    """
 
     auth_headers = get_accu360_auth_header()
+    digits = normalize_phone_digits(customer_phone)
+    last9 = digits[-9:] if len(digits) >= 9 else digits
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Search for customer by phone number
-        search_filters = f'[["mobile_no","like","%{customer_phone[-9:]}%"]]'
-        search_url = f"{ACCU360_API_BASE_URL}/api/resource/Customer?filters={search_filters}&fields=[\"name\",\"customer_name\",\"mobile_no\"]"
+        # 1. Search Customer doctype on both mobile_no and mobile_number
+        if last9:
+            customer_or_filters = (
+                f'[["mobile_no","like","%{last9}%"],'
+                f'["mobile_number","like","%{last9}%"]]'
+            )
+            customer_url = (
+                f"{ACCU360_API_BASE_URL}/api/resource/Customer"
+                f"?or_filters={customer_or_filters}"
+                f"&fields=[\"name\",\"customer_name\",\"mobile_no\",\"mobile_number\"]"
+                f"&limit_page_length=1"
+            )
+            response = await client.get(customer_url, headers=auth_headers)
+            if response.status_code == 200:
+                data = safe_response_json(response)
+                customers = data.get("data", [])
+                if customers:
+                    return customers[0].get("name", customer_name)
 
-        response = await client.get(
-            search_url,
-            headers=auth_headers
-        )
-
-        if response.status_code == 200:
-            data = safe_response_json(response)
-            customers = data.get("data", [])
-            if customers:
-                # Found existing customer - return the "name" field (customer ID)
-                return customers[0].get("name", customer_name)
+            # 2. Fallback: search Contact, then follow dynamic_link to Customer
+            contact_or_filters = (
+                f'[["mobile_no","like","%{last9}%"],'
+                f'["phone","like","%{last9}%"]]'
+            )
+            contact_url = (
+                f"{ACCU360_API_BASE_URL}/api/resource/Contact"
+                f"?or_filters={contact_or_filters}"
+                f"&fields=[\"name\"]"
+                f"&limit_page_length=5"
+            )
+            contact_response = await client.get(contact_url, headers=auth_headers)
+            if contact_response.status_code == 200:
+                contact_data = safe_response_json(contact_response)
+                for contact in contact_data.get("data", []):
+                    contact_name = contact.get("name")
+                    if not contact_name:
+                        continue
+                    # Fetch the full Contact to read its links
+                    detail = await client.get(
+                        f"{ACCU360_API_BASE_URL}/api/resource/Contact/{contact_name}",
+                        headers=auth_headers,
+                    )
+                    if detail.status_code != 200:
+                        continue
+                    links = safe_response_json(detail).get("data", {}).get("links", []) or []
+                    for link in links:
+                        if link.get("link_doctype") == "Customer" and link.get("link_name"):
+                            return link["link_name"]
 
         # Customer not found - create new one
         new_customer = {
@@ -402,22 +474,40 @@ async def create_order(
 
         # Build Frappe Sales Order payload
         discount = request.discount or 0.0
-        accu360_payload = {
-            "doctype": "Sales Order",
-            "customer": customer_id,
-            "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d"),
-            "po_no": order_id,
-            "customer_address": shipping_address_name,
-            "shipping_address_name": shipping_address_name,
-            "items": [
-                {
+        delivery_date = (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        so_items = []
+        for item in request.items:
+            weight_per_unit_kg = parse_weight_per_unit_kg(item.unit)
+            if weight_per_unit_kg and weight_per_unit_kg > 0:
+                # Weighted item: send qty in kg so inventory (stored in Kg) deducts correctly,
+                # rebase rate to per-kg so the line total stays equal to quantity * unit_price.
+                qty_kg = item.quantity * weight_per_unit_kg
+                rate_per_kg = item.unit_price / weight_per_unit_kg
+                so_items.append({
+                    "item_code": item.accu360_sku,
+                    "qty": qty_kg,
+                    "rate": rate_per_kg,
+                    "weight_per_unit": 1,
+                    "weight_uom": "Kg",
+                    "delivery_date": delivery_date,
+                })
+            else:
+                so_items.append({
                     "item_code": item.accu360_sku,
                     "qty": item.quantity,
                     "rate": item.unit_price,
-                    "delivery_date": (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
-                }
-                for item in request.items
-            ],
+                    "delivery_date": delivery_date,
+                })
+
+        accu360_payload = {
+            "doctype": "Sales Order",
+            "customer": customer_id,
+            "delivery_date": delivery_date,
+            "po_no": order_id,
+            "customer_address": shipping_address_name,
+            "shipping_address_name": shipping_address_name,
+            "items": so_items,
             "contact_phone": request.customer_phone,
             "instructions": request.delivery_notes or ""
         }
