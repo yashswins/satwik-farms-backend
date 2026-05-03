@@ -317,30 +317,46 @@ async def find_or_create_customer(
         if needle:
             # 1. Primary search: Customer.customer_name. In this Frappe instance the
             #    field labelled "Mobile Number" on Customer has DB fieldname
-            #    customer_name (legacy from how manual entries were set up). Manually-
-            #    created customers have customer_name = phone, so this search hits
-            #    them. We also write customer_name = phone on create going forward.
-            #    Also include mobile_no / mobile_number as additional matches.
+            #    customer_name (legacy from how manual entries were set up).
+            #    Manually-created customers have customer_name = phone; new
+            #    app-created customers also store customer_name = phone, so this
+            #    one filter catches both. Using a single-field `filters` (AND list
+            #    with one condition) instead of or_filters because some Frappe
+            #    versions ignore or_filters via REST and including non-existent
+            #    fields silently rejects the whole query.
+            print(f"INFO: customer search for last9={last9} (input phone={customer_phone})")
             customer_resp = await client.get(
                 f"{ACCU360_API_BASE_URL}/api/resource/Customer",
                 headers=auth_headers,
                 params={
-                    "or_filters": json.dumps([
-                        ["customer_name", "like", needle],
-                        ["mobile_no", "like", needle],
-                        ["mobile_number", "like", needle],
-                    ]),
-                    "fields": json.dumps(["name", "customer_name", "mobile_no", "mobile_number"]),
-                    "limit_page_length": 10,
+                    "filters": json.dumps([["customer_name", "like", needle]]),
+                    "fields": json.dumps(["name", "customer_name"]),
+                    "limit_page_length": 20,
                 },
             )
+            print(f"INFO: customer search status={customer_resp.status_code} body={customer_resp.text[:300]}")
             if customer_resp.status_code == 200:
                 for cust in safe_response_json(customer_resp).get("data", []) or []:
-                    if (
-                        _phone_matches(cust.get("customer_name"), last9)
-                        or _phone_matches(cust.get("mobile_no"), last9)
-                        or _phone_matches(cust.get("mobile_number"), last9)
-                    ):
+                    if _phone_matches(cust.get("customer_name"), last9):
+                        print(f"INFO: matched existing customer {cust.get('name')} customer_name={cust.get('customer_name')}")
+                        return cust.get("name", customer_name)
+
+            # 1b. Secondary: search mobile_no on Customer (in case some records
+            #     have phone only there, not in customer_name).
+            customer_resp2 = await client.get(
+                f"{ACCU360_API_BASE_URL}/api/resource/Customer",
+                headers=auth_headers,
+                params={
+                    "filters": json.dumps([["mobile_no", "like", needle]]),
+                    "fields": json.dumps(["name", "customer_name", "mobile_no"]),
+                    "limit_page_length": 20,
+                },
+            )
+            print(f"INFO: customer mobile_no search status={customer_resp2.status_code} body={customer_resp2.text[:300]}")
+            if customer_resp2.status_code == 200:
+                for cust in safe_response_json(customer_resp2).get("data", []) or []:
+                    if _phone_matches(cust.get("mobile_no"), last9) or _phone_matches(cust.get("customer_name"), last9):
+                        print(f"INFO: matched existing customer {cust.get('name')} via mobile_no")
                         return cust.get("name", customer_name)
 
             # 2. Fallback A: search Contact's top-level mobile_no/phone fields.
