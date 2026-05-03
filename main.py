@@ -324,7 +324,6 @@ async def find_or_create_customer(
             #    with one condition) instead of or_filters because some Frappe
             #    versions ignore or_filters via REST and including non-existent
             #    fields silently rejects the whole query.
-            print(f"INFO: customer search for last9={last9} (input phone={customer_phone})")
             customer_resp = await client.get(
                 f"{ACCU360_API_BASE_URL}/api/resource/Customer",
                 headers=auth_headers,
@@ -334,11 +333,9 @@ async def find_or_create_customer(
                     "limit_page_length": 20,
                 },
             )
-            print(f"INFO: customer search status={customer_resp.status_code} body={customer_resp.text[:300]}")
             if customer_resp.status_code == 200:
                 for cust in safe_response_json(customer_resp).get("data", []) or []:
                     if _phone_matches(cust.get("customer_name"), last9):
-                        print(f"INFO: matched existing customer {cust.get('name')} customer_name={cust.get('customer_name')}")
                         return cust.get("name", customer_name)
 
             # 1b. Secondary: search mobile_no on Customer (in case some records
@@ -352,11 +349,9 @@ async def find_or_create_customer(
                     "limit_page_length": 20,
                 },
             )
-            print(f"INFO: customer mobile_no search status={customer_resp2.status_code} body={customer_resp2.text[:300]}")
             if customer_resp2.status_code == 200:
                 for cust in safe_response_json(customer_resp2).get("data", []) or []:
                     if _phone_matches(cust.get("mobile_no"), last9) or _phone_matches(cust.get("customer_name"), last9):
-                        print(f"INFO: matched existing customer {cust.get('name')} via mobile_no")
                         return cust.get("name", customer_name)
 
             # 2. Fallback A: search Contact's top-level mobile_no/phone fields.
